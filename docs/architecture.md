@@ -1,73 +1,92 @@
-# Architecture
+# Chanamill MTM Order Architecture
 
 ## Context
 
-A commerce order crosses multiple independently failing boundaries. Inventory can be unavailable, payment can time out, fulfillment can reject a request, and any message can be delivered more than once.
-
-A single database transaction cannot safely cover these systems.
+Chanamill's made-to-measure order flow crosses software, payment, manufacturing, quality control, freight, fulfillment, and customer feedback. These boundaries fail independently, and some steps create physical work that cannot simply be rolled back.
 
 ## Decision
 
-Use an explicit saga coordinator with durable workflow state and idempotent handlers.
+Use explicit orchestration with durable workflow state, idempotent commands, immutable order inputs, and a manual-review path.
 
 ```text
-Order API
+Checkout
    ↓
-Persist order + saga state
-   ↓
-Reserve inventory
+Persist order
+   ├── FitID snapshot
+   ├── garment spec version
+   └── selected configuration
    ↓
 Authorize payment
    ↓
+Create production job
+   ↓
+Manufacturing
+   ↓
+Record QC result
+   ↓
 Request fulfillment
    ↓
-Complete
-
-Failure at an intermediate step
+Delivery
    ↓
-Compensation in reverse dependency order
+Capture fit feedback
+   ↓
+Complete
 ```
 
 ## Why orchestration
 
-The core order path has a defined start, ordered steps, business-critical state, and compensation. Making the control flow explicit is easier to operate than distributing the workflow across unrelated event consumers.
+This workflow has ordered dependencies and business-critical state. Production and QC are not interchangeable event consumers; they are explicit stages with different failure and compensation semantics.
 
-## Failure model
+## Failure classes
 
-The implementation is designed around at-least-once execution assumptions:
+### Retryable technical failure
+Examples: timeout, temporary API failure, duplicate delivery.
 
-- duplicate commands are expected
-- timeouts do not imply downstream failure
-- handlers must be idempotent
-- state transitions must reject impossible sequences
-- compensation must itself be retry-safe
+Action: retry idempotently.
 
-## Production persistence
+### Business rejection
+Examples: production cannot accept configuration, QC fails.
 
-The reference implementation keeps state in process. A production system would persist saga state and outbox records transactionally, then deliver commands/events asynchronously.
+Action: transition to review or compensation.
 
-A common shape:
+### Irreversible physical progress
+Examples: garment already cut or stitched.
+
+Action: do not pretend the operation can be transactionally rolled back; preserve state and escalate according to business policy.
+
+## Consistency model
+
+The service should persist state and an outbox event in one transaction:
 
 ```text
 DB transaction
   ├── update order/saga state
-  └── append outbox event
+  └── append outbox record
         ↓
-Outbox publisher
+Publisher
         ↓
-Message broker
+Operational integration
 ```
 
-This avoids the dual-write problem between database state and message publication.
+This avoids losing an external command after committing local state.
+
+## Order-time immutability
+
+The order references the exact FitID and garment specification versions used at checkout. Later profile or pattern changes must not rewrite the historical decision.
 
 ## Observability
 
-Important metrics:
-
-- saga completion latency
-- retries by step
-- compensation rate
+Useful metrics include:
+- time from order to production
+- time in production
+- QC failure rate
+- manual-review count
+- retries by integration boundary
 - duplicate-command rate
-- stuck workflow count
-- downstream timeout/error rate
-- age of oldest incomplete saga
+- shipment latency
+- delivered-fit feedback completion
+- age of oldest incomplete workflow
+
+## Public/private boundary
+
+This repository models the architecture and reliability layer. Production integrations, partner identifiers, FitID algorithms, measurement methods, and manufacturing details remain private.
